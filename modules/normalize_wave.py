@@ -218,6 +218,15 @@ def wavelet_denoising(ecg_signal, wavelet='db4', mode='soft', sigma=None):
         # Reconstruct signal
         denoised = pywt.waverec(coeffs_thresh, wavelet, mode='symmetric')
         
+        # Ensure the denoised signal has the same length as the input
+        if len(denoised) != len(signal_1d):
+            if len(denoised) > len(signal_1d):
+                # Truncate if too long
+                denoised = denoised[:len(signal_1d)]
+            else:
+                # Pad with zeros if too short
+                denoised = np.pad(denoised, (0, len(signal_1d) - len(denoised)), mode='constant')
+        
         return denoised
     
     if ecg_signal.ndim == 1:
