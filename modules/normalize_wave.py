@@ -328,3 +328,70 @@ def normalize_amplitude(ecg_signal, method='z_score', target_range=(-1, 1)):
         raise ValueError("ECG signal must be 1D or 2D array")
     
     return normalized_signal
+
+def pad_signal(ecg_signal, padding_length=2048):
+    """
+    Pad or truncate a single ECG signal to a fixed length.
+
+    This function takes a single ECG signal and pads it with zeros or truncates
+    it to ensure it has a specified length.
+
+    Args:
+        ecg_signal (numpy.ndarray): A 1D or 2D ECG signal array in the format
+                                    (# samples) or (# samples, # leads).
+        padding_length (int, optional): The target length for the signal. 
+                                       Default is 2048.
+    
+    Returns:
+        numpy.ndarray: The signal, padded or truncated to `padding_length`.
+    """
+    if not isinstance(ecg_signal, np.ndarray):
+        raise ValueError("ECG signal must be a numpy array")
+
+    if ecg_signal.ndim not in [1, 2]:
+        raise ValueError("ECG signal must be a 1D or 2D array")
+
+    current_length = ecg_signal.shape[0]
+
+    if current_length == padding_length:
+        return ecg_signal
+    
+    if current_length > padding_length:
+        # Truncate the signal
+        return ecg_signal[:padding_length]
+    else:
+        # Pad the signal
+        pad_width = padding_length - current_length
+        if ecg_signal.ndim == 1:
+            # Pad a 1D signal
+            return np.pad(ecg_signal, (0, pad_width), mode='constant')
+        else: # ndim == 2
+            # Pad a 2D signal only on the sample axis (axis 0)
+            return np.pad(ecg_signal, ((0, pad_width), (0, 0)), mode='constant')
+
+def trim_signal(ecg_signal, length=2048):
+    """
+    Trim a single ECG signal to a fixed length if it is longer.
+
+    This function takes a single ECG signal and trims it to a specified length.
+    If the signal is shorter than or equal to the target length, it is returned unmodified.
+    
+    Args:
+        ecg_signal (numpy.ndarray): A 1D or 2D ECG signal array in the format
+                                    (# samples) or (# samples, # leads).
+        length (int, optional): The maximum target length for the signal. Default is 2048.
+
+    Returns:
+        numpy.ndarray: The signal, trimmed if it was longer than `length`.
+    """
+    if not isinstance(ecg_signal, np.ndarray):
+        raise ValueError("ECG signal must be a numpy array")
+
+    if ecg_signal.ndim not in [1, 2]:
+        raise ValueError("ECG signal must be a 1D or 2D array")
+
+    if ecg_signal.shape[0] > length:
+        return ecg_signal[:length]
+    else:
+        return ecg_signal
+        

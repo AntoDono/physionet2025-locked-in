@@ -16,6 +16,7 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 import sys
 
 from helper_code import *
+from implementations.gnn import train_model as train_gnn_model
 
 ################################################################################
 #
@@ -28,65 +29,7 @@ from helper_code import *
 
 # Train your model.
 def train_model(data_folder, model_folder, verbose):
-    # Find the data files.
-    if verbose:
-        print('Finding the Challenge data...')
-
-    records = find_records(data_folder)
-    num_records = len(records)
-
-    if num_records == 0:
-        raise FileNotFoundError('No data were provided.')
-
-    # Extract the features and labels from the data.
-    if verbose:
-        print('Extracting features and labels from the data...')
-
-    # Iterate over the records to extract the features and labels.
-    features = list()
-    labels = list()
-    for i in range(num_records):
-        if verbose:
-            width = len(str(num_records))
-            print(f'- {i+1:>{width}}/{num_records}: {records[i]}...')
-
-        record = os.path.join(data_folder, records[i])
-        age, sex, source, signal_mean, signal_std = extract_features(record)
-        label = load_label(record)
-
-        # Store the features and labels, but skip most of the CODE-15% data because there are many records, and the labels are weak.
-        # You can treat the different data sources however you might like in your training code.
-        if source != 'CODE-15%' or (i % 10) == 0:
-            features.append(np.concatenate((age, sex, signal_mean, signal_std)))
-            labels.append(label)
-
-    features = np.asarray(features, dtype=np.float32)
-    labels = np.asarray(labels, dtype=bool)
-
-    # Train the models on the features.
-    if verbose:
-        print('Training the model on the data...')
-
-    # This very simple model trains a random forest model with very simple features.
-
-    # Define the parameters for the random forest classifier and regressor.
-    n_estimators = 12  # Number of trees in the forest.
-    max_leaf_nodes = 34  # Maximum number of leaf nodes in each tree.
-    random_state = 56  # Random state; set for reproducibility.
-
-    # Fit the model.
-    model = RandomForestClassifier(
-        n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
-
-    # Create a folder for the model if it does not already exist.
-    os.makedirs(model_folder, exist_ok=True)
-
-    # Save the model.
-    save_model(model_folder, model)
-
-    if verbose:
-        print('Done.')
-        print()
+    train_gnn_model(data_folder, 512, device='cuda:1')
 
 # Load your trained models. This function is *required*. You should edit this function to add your code, but do *not* change the
 # arguments of this function. If you do not train one of the models, then you can return None for the model.

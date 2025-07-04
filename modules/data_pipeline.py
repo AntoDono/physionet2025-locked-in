@@ -3,32 +3,64 @@ import os
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
+import random
 
 # Add the parent directory to the Python path to access helper_code
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helper_code import *
-from normalize_wave import normalize_amplitude, wavelet_denoising
+
+try:
+    from normalize_wave import normalize_amplitude, wavelet_denoising, trim_signal, pad_signal
+except ImportError:
+    from .normalize_wave import normalize_amplitude, wavelet_denoising, trim_signal, pad_signal
 
 def data_stats(df):
+    """
+    Print statistics about the data
+    
+    Args:
+        df (pandas.DataFrame): The dataframe containing the data
+        
+    Returns:
+        None
+    """
     print(f"Number of records: {len(df)}")
     print(f"Number of records with label 1: {df[df['label'] == 1].shape[0]}")
     print(f"Number of records with label 0: {df[df['label'] == 0].shape[0]}")
 
-def load_data(path="./data"):
+def load_data(path="./data", num_records=None, use_cache=True):
+    """
+    Load the data from the path
     
-    if os.path.exists("saved_data"):
+    Args:
+        path (str): The path to the data
+        use_cache (bool): Whether to use the cached data
+        
+    Returns:
+        pandas.DataFrame: The dataframe containing the data
+    """
+    
+    if os.path.exists("saved_data") and use_cache:
         df = pd.read_pickle("./saved_data/data.pkl")
         data_stats(df)
         return df
     else:
-        os.makedirs("saved_data")
+        if not os.path.exists("saved_data"):
+            os.makedirs("saved_data")
     
     records = find_records(path)
+    random.seed(42)
+    random.shuffle(records)
+    
+    if num_records is not None:
+        records = records[:num_records]
     
     data = []
+    pbar = tqdm(records)
+    pbar.set_description("Fetching data")
     
-    for record in tqdm(records):
+    for record in pbar:
         
         record_path = f"{path}/{record}"
         
@@ -67,19 +99,81 @@ def load_data(path="./data"):
     data_stats(df)
     return df
 
-def batch_normalize_data(df):
-    for i in tqdm(range(len(df))):
+def batch_normalize_data(df, length=2048):
+    pbar = tqdm(range(len(df)))
+    pbar.set_description("Normalizing Denoising Padding Data")
+    for i in pbar:
         # Convert to numpy array if it isn't already
-        signal = df.iloc[i]['signal']
+        signal = df.iloc[i]['signal'] # Signal is in (# samples, # leads) format
         
         # Apply normalization and denoising
         signal = normalize_amplitude(signal)
         signal = wavelet_denoising(signal)
+        signal = trim_signal(signal, length)
+        signal = pad_signal(signal, length)
         
         # Assign back to dataframe using .at for proper assignment
         df.at[i, 'signal'] = signal
     return df
+
+def balance_data(df, strategy='oversample'):
+    """
+    Balance the data by either over-sampling the minority class or
+    down-sampling the majority class.
+
+    A warning is issued if the class imbalance ratio is over 10 when
+    oversampling, as this may lead to overfitting.
+    
+    Args:
+        df (pd.DataFrame): The input dataframe.
+        strategy (str): 'oversample' or 'downsample'.
+    
+    Returns:
+        pd.DataFrame: A balanced dataframe.
+    """
+    df_1 = df[df['label'] == 1]
+    df_0 = df[df['label'] == 0]
+
+    if len(df_1) == len(df_0):
+        return df.copy()
+
+    if len(df_1) > len(df_0):
+        majority_df, minority_df = df_1, df_0
+    else:
+        majority_df, minority_df = df_0, df_1
+
+    if len(minority_df) == 0:
+        print("WARNING: Minority class has no samples. Cannot balance data.")
+        return df
+
+    if strategy == 'oversample':
+        imbalance_ratio = len(majority_df) / len(minority_df)
+        if imbalance_ratio > 10:
+            print("\n" + "!"*60)
+            print("! WARNING: High class imbalance detected for oversampling.")
+            print(f"! Majority: {len(majority_df)} samples. Minority: {len(minority_df)} samples.")
+            print(f"! Ratio: {imbalance_ratio:.1f} to 1.")
+            print("! Oversampling may lead to overfitting.")
+            print("!"*60 + "\n")
+        
+        resampled_minority = minority_df.sample(len(majority_df), replace=True, random_state=42)
+        balanced_df = pd.concat([majority_df, resampled_minority])
+    
+    elif strategy == 'downsample':
+        resampled_majority = majority_df.sample(len(minority_df), replace=False, random_state=42)
+        balanced_df = pd.concat([resampled_majority, minority_df])
+        
+    else:
+        raise ValueError("Strategy must be 'oversample' or 'downsample'")
+
+    return balanced_df.sample(frac=1, random_state=42).reset_index(drop=True)
             
-df = load_data()
-df = batch_normalize_data(df)
-print(df.head())
+            
+if __name__ == "__main__":
+    from visualize import visualize_ecg
+    df = load_data(use_cache=False, num_records=5000)
+    df = batch_normalize_data(df, length=512)
+    df = balance_data(df, strategy='oversample')
+    print(df['label'].value_counts())
+    print("Example signal shape: ", df.iloc[0]['signal'].shape)
+    visualize_ecg(df.iloc[0]['signal'])
