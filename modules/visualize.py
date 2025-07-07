@@ -41,4 +41,4 @@ def visualize_ecg(normalized_signal, sampling_frequency=400, title="Normalized E
     axes[-1].set_xlabel("Time (s)")
     fig.suptitle(title, fontsize=16)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust for suptitle and xlabel
-    plt.savefig(f"visualizations/ecg_signal.png")
+    plt.savefig(f"visualizations/{title.replace(' ', '_')}.png")

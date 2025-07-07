@@ -197,26 +197,45 @@ def wavelet_denoising(ecg_signal, wavelet='db4', mode='soft', sigma=None):
     if mode not in ['soft', 'hard']:
         raise ValueError("Mode must be 'soft' or 'hard'")
     
+    has_error = False
+    
     def denoise_1d(signal_1d):
-        # Wavelet decomposition
-        coeffs = pywt.wavedec(signal_1d, wavelet, mode='symmetric')
+        nonlocal has_error
+        # Check for NaN or inf values and handle them
+        if not np.isfinite(signal_1d).all():
+            print(f"Warning: Found non-finite values in signal during wavelet denoising. Replacing with zeros.")
+            signal_1d = np.where(np.isfinite(signal_1d), signal_1d, 0.0)
         
-        # Estimate noise standard deviation if not provided
-        if sigma is None:
-            # Estimate sigma from the finest detail coefficients
-            sigma_est = np.median(np.abs(coeffs[-1])) / 0.6745
-        else:
-            sigma_est = sigma
+        # Decompose to get the wavelet coefficients
+        # Choose a level of decomposition
+        level = pywt.dwt_max_level(len(signal_1d), pywt.Wavelet(wavelet).dec_len)
+        coeffs = pywt.wavedec(signal_1d, wavelet, level=level)
+
+        # To remove noise, we’ll use level-dependent thresholds.
+        # We will apply a soft threshold to the detail coefficients at each level.
+        # We need to estimate the noise variance σ^2. A good estimate is given by the
+        # median absolute deviation (MAD) of the diagonal coefficients at the first level
+        sigma = np.median(np.abs(coeffs[-level])) / 0.6745
+
+
+        # Now we need to compute the threshold value for each level.
+        # A common choice is the universal threshold, given by σ * sqrt(2 * log(n)).
+        # We will use it for each decomposition level.
+        threshold = sigma * np.sqrt(2 * np.log(len(signal_1d)))
         
-        # Calculate threshold using Donoho-Johnstone threshold
-        threshold = sigma_est * np.sqrt(2 * np.log(len(signal_1d)))
-        
-        # Apply thresholding to detail coefficients
+        # Apply thresholding
         coeffs_thresh = list(coeffs)
-        coeffs_thresh[1:] = [pywt.threshold(detail, threshold, mode=mode) for detail in coeffs[1:]]
-        
+        for i in range(1, len(coeffs)):
+            coeffs_thresh[i] = pywt.threshold(coeffs[i], threshold, mode=mode)
+            
         # Reconstruct signal
         denoised = pywt.waverec(coeffs_thresh, wavelet, mode='symmetric')
+        
+        # Check if reconstruction produced valid values
+        if not np.isfinite(denoised).all():
+            print(f"Warning: Wavelet reconstruction produced non-finite values. Returning original signal.")
+            has_error = True
+            return signal_1d
         
         # Ensure the denoised signal has the same length as the input
         if len(denoised) != len(signal_1d):
@@ -226,8 +245,12 @@ def wavelet_denoising(ecg_signal, wavelet='db4', mode='soft', sigma=None):
             else:
                 # Pad with zeros if too short
                 denoised = np.pad(denoised, (0, len(signal_1d) - len(denoised)), mode='constant')
-        
+                
         return denoised
+    
+    if has_error:
+        from .visualize import visualize_ecg
+        visualize_ecg(ecg_signal, title="Original ECG Signal")
     
     if ecg_signal.ndim == 1:
         # Single lead signal
@@ -239,6 +262,13 @@ def wavelet_denoising(ecg_signal, wavelet='db4', mode='soft', sigma=None):
             denoised_signal[:, lead_idx] = denoise_1d(ecg_signal[:, lead_idx])
     else:
         raise ValueError("ECG signal must be 1D or 2D array")
+    
+    if has_error:
+        from .visualize import visualize_ecg
+        visualize_ecg(ecg_signal, title="Denoised ECG Signal")
+        
+    if has_error:
+        raise Exception("Denoising failed")
     
     return denoised_signal
 
@@ -280,11 +310,16 @@ def normalize_amplitude(ecg_signal, method='z_score', target_range=(-1, 1)):
         raise ValueError("Target range must be a tuple (min, max) with min < max")
     
     def normalize_1d(signal_1d, method):
+        # Check for NaN or inf values and handle them
+        if not np.isfinite(signal_1d).all():
+            print(f"Warning: Found non-finite values in signal during normalization. Replacing with zeros.")
+            signal_1d = np.where(np.isfinite(signal_1d), signal_1d, 0.0)
+        
         if method == 'z_score':
             # Z-score normalization (mean=0, std=1) - ideal for comparative analysis
             mean_val = np.mean(signal_1d)
             std_val = np.std(signal_1d)
-            if std_val == 0:
+            if std_val == 0 or not np.isfinite(mean_val) or not np.isfinite(std_val):
                 return np.zeros_like(signal_1d)
             return (signal_1d - mean_val) / std_val
             

@@ -25,11 +25,12 @@ def data_stats(df):
     Returns:
         None
     """
-    print(f"Number of records: {len(df)}")
-    print(f"Number of records with label 1: {df[df['label'] == 1].shape[0]}")
-    print(f"Number of records with label 0: {df[df['label'] == 0].shape[0]}")
-
-def load_data(path="./data", num_records=None, use_cache=True):
+    print("=" * 60)
+    print(f"Size: {len(df)} | Positives: {df[df['label'] == 1].shape[0]} | Negatives: {df[df['label'] == 0].shape[0]}")
+    print(f"Ratio: {df[df['label'] == 1].shape[0] / df[df['label'] == 0].shape[0]:.2f}")
+    print("=" * 60)
+    
+def load_data(path="./data", num_records=None, use_cache=True, sequence_length=512):
     """
     Load the data from the path
     
@@ -43,6 +44,8 @@ def load_data(path="./data", num_records=None, use_cache=True):
     
     if os.path.exists("saved_data") and use_cache:
         df = pd.read_pickle("./saved_data/data.pkl")
+        if num_records is not None:
+            df = df.sample(num_records, random_state=42)
         data_stats(df)
         return df
     else:
@@ -95,11 +98,12 @@ def load_data(path="./data", num_records=None, use_cache=True):
             continue
         
     df = pd.DataFrame(data)
+    df = batch_normalize_data(df, length=sequence_length)
     df.to_pickle("./saved_data/data.pkl")
     data_stats(df)
     return df
 
-def batch_normalize_data(df, length=2048):
+def batch_normalize_data(df, length=512):
     pbar = tqdm(range(len(df)))
     pbar.set_description("Normalizing Denoising Padding Data")
     for i in pbar:
@@ -107,8 +111,8 @@ def batch_normalize_data(df, length=2048):
         signal = df.iloc[i]['signal'] # Signal is in (# samples, # leads) format
         
         # Apply normalization and denoising
+        # signal = wavelet_denoising(signal) # this shit is so ass :sob:
         signal = normalize_amplitude(signal)
-        signal = wavelet_denoising(signal)
         signal = trim_signal(signal, length)
         signal = pad_signal(signal, length)
         
@@ -116,7 +120,7 @@ def batch_normalize_data(df, length=2048):
         df.at[i, 'signal'] = signal
     return df
 
-def balance_data(df, strategy='oversample'):
+def balance_data(df, strategy='oversample', num_records=None):
     """
     Balance the data by either over-sampling the minority class or
     down-sampling the majority class.
@@ -165,8 +169,14 @@ def balance_data(df, strategy='oversample'):
         
     else:
         raise ValueError("Strategy must be 'oversample' or 'downsample'")
-
-    return balanced_df.sample(frac=1, random_state=42).reset_index(drop=True)
+    
+    if num_records is not None:
+        balanced_df = balanced_df.sample(num_records, random_state=42)
+    else:
+        balanced_df = balanced_df.sample(frac=1, random_state=42).reset_index(drop=True)
+        
+    data_stats(balanced_df)
+    return balanced_df
             
             
 if __name__ == "__main__":

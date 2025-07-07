@@ -8,11 +8,12 @@ import os
 import pickle
 from pathlib import Path
 import sys
-
+from tqdm import tqdm
+import pandas as pd
 # Add parent directory to path to access modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.data_pipeline import load_data, batch_normalize_data, balance_data
+from modules.data_pipeline import load_data, batch_normalize_data, balance_data, data_stats
 from modules.normalize_wave import normalize_amplitude, wavelet_denoising, trim_signal, pad_signal
 from helper_code import reorder_signal, get_signal_names, load_header, load_signals
 
@@ -159,11 +160,11 @@ class ECGChagas(nn.Module):
     """Complete ECG to Chagas prediction pipeline"""
     
     def __init__(self, 
-                 cnn_node_dim=128,
-                 gat_hidden_dim=64,
-                 gat_heads=4,
-                 gat_layers=2,
-                 dropout=0.3):
+                 cnn_node_dim=64,
+                 gat_hidden_dim=32,
+                 gat_heads=8,
+                 gat_layers=4,
+                 dropout=0.1):
         super(ECGChagas, self).__init__()
         
         # Lead encoder (your existing CNN)
@@ -241,24 +242,38 @@ def train_model(training_data_folder, sequence_length=1024, device='cpu'):
     """
     
     print("Loading data using data pipeline...")
-    df = load_data(path=training_data_folder, num_records=5000, use_cache=False)
-    df = batch_normalize_data(df, length=sequence_length)
-    df = balance_data(df, strategy='downsample')
+    df = load_data(path=training_data_folder, use_cache=True, sequence_length=sequence_length)
     
-    dataset = ECGDatasetFromPipeline(df)
+    # Create hold-out validation set with 100 positive and 100 negative samples
+    positive_df = df[df['label'] == 1]
+    negative_df = df[df['label'] == 0]
     
-    print(f"Found {len(dataset)} records")
+    # Sample 100 from each class for validation, this is holdout validation
+    val_positive = positive_df.sample(n=min(100, len(positive_df)), random_state=42)
+    val_negative = negative_df.sample(n=min(100, len(negative_df)), random_state=42)
     
-    # Split into train/validation (80/20 split)
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    # Combine to create validation set
+    val_df = pd.concat([val_positive, val_negative])
+    print("Validation set:")
+    data_stats(val_df)
     
-    print(f"Training on {train_size} records, validating on {val_size} records")
+    # Remove validation samples from main dataset
+    remaining_indices = df.index.difference(val_df.index)
+    train_df = df.loc[remaining_indices]
+    
+    # Balance only the training data
+    print("Training set:")
+    train_df = balance_data(train_df, strategy='oversample')
+    
+    # Create datasets
+    train_dataset = ECGDatasetFromPipeline(train_df)
+    val_dataset = ECGDatasetFromPipeline(val_df)
+    
+    print(f"Training on {len(train_dataset)} records (after balancing), validating on {len(val_dataset)} records")
     
     # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=512, shuffle=False)
     
     # Check label distribution
     print("Checking label distribution...")
@@ -275,38 +290,81 @@ def train_model(training_data_folder, sequence_length=1024, device='cpu'):
     print(f"Using device: {device}")
     
     model = ECGChagas(
-        cnn_node_dim=64,
-        gat_hidden_dim=32,
-        gat_heads=2,
+        cnn_node_dim=128,
+        gat_hidden_dim=64,
+        gat_heads=8,
         gat_layers=2,
-        dropout=0.2
+        dropout=0.1
     ).to(device)
     
     # Simple training setup
     criterion = nn.BCEWithLogitsLoss()
+    epochs = 15
     optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2)
     
     print("Starting training...")
     
     # Train for 10 epochs
-    for epoch in range(10):
+    for epoch in range(epochs):
         # TRAINING PHASE
         model.train()
         train_loss = 0
         train_correct = 0
         train_total = 0
         
-        for batch_idx, (ecg_data, labels) in enumerate(train_loader):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+        for batch_idx, (ecg_data, labels) in enumerate(pbar):
+            # Comprehensive data validation
+            if not torch.isfinite(ecg_data).all():
+                print(f"\nEpoch {epoch}, Batch {batch_idx}: FOUND PROBLEMATIC DATA!")
+                print(f"  ECG data shape: {ecg_data.shape}")
+                print(f"  Contains NaN: {torch.isnan(ecg_data).any().item()}")
+                print(f"  Contains Inf: {torch.isinf(ecg_data).any().item()}")
+                print(f"  Min value: {torch.min(ecg_data).item()}")
+                print(f"  Max value: {torch.max(ecg_data).item()}")
+                print(f"  Mean: {torch.mean(ecg_data).item()}")
+                print(f"  Std: {torch.std(ecg_data).item()}")
+                
+                # Check which samples and leads have issues
+                nan_mask = torch.isnan(ecg_data)
+                inf_mask = torch.isinf(ecg_data)
+                
+                if nan_mask.any():
+                    nan_samples = torch.any(nan_mask.view(ecg_data.size(0), -1), dim=1).nonzero().squeeze()
+                    print(f"  Samples with NaN: {nan_samples.tolist() if nan_samples.numel() > 1 else [nan_samples.item()]}")
+                
+                if inf_mask.any():
+                    inf_samples = torch.any(inf_mask.view(ecg_data.size(0), -1), dim=1).nonzero().squeeze()
+                    print(f"  Samples with Inf: {inf_samples.tolist() if inf_samples.numel() > 1 else [inf_samples.item()]}")
+                
+                print("  Skipping this batch...\n")
+                continue
+
             ecg_data = ecg_data.to(device)
             labels = labels.to(device)
             
             optimizer.zero_grad()
             logits = model(ecg_data)
-            loss = criterion(logits, labels)
-            loss.backward()
             
-            # Clip gradients to prevent exploding gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # ===================================
+            ## DOUBLE PENALITY FOR FALSE NEGATIVES
+            # ===================================
+            
+            # Calculate predictions for false negative detection
+            with torch.no_grad():
+                predictions = (torch.sigmoid(logits) > 0.5).float()
+                # False negatives: predicted 0, actual 1
+                false_negatives = (predictions == 0) & (labels == 1)
+            
+            # Create weights: 1.5x negatives for false negatives and regular loss for everything else
+            weights = torch.ones_like(labels)
+            weights[false_negatives] = 1.5
+            
+            # Calculate weighted loss
+            loss = F.binary_cross_entropy_with_logits(logits, labels, weight=weights)
+                
+            loss.backward()
             
             optimizer.step()
             
@@ -317,8 +375,7 @@ def train_model(training_data_folder, sequence_length=1024, device='cpu'):
             train_correct += (predictions == labels).sum().item()
             train_total += labels.size(0)
             
-            if batch_idx % 20 == 0:
-                print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {loss.item():.4f}")
+            pbar.set_description(f"Epoch {epoch} - Loss: {loss.item():.4f}")
         
         # VALIDATION PHASE
         model.eval()
@@ -353,6 +410,9 @@ def train_model(training_data_folder, sequence_length=1024, device='cpu'):
         train_loss_avg = train_loss / len(train_loader)
         val_loss_avg = val_loss / len(val_loader)
         
+        # Step the learning rate scheduler
+        scheduler.step(val_loss_avg)
+        
         # Calculate AUC if possible
         try:
             from sklearn.metrics import roc_auc_score, precision_score, recall_score
@@ -361,13 +421,13 @@ def train_model(training_data_folder, sequence_length=1024, device='cpu'):
             val_recall = recall_score(val_labels_list, [p > 0.5 for p in val_predictions])
             
             print(f"Epoch {epoch}:")
-            print(f"  Train - Loss: {train_loss_avg:.4f}, Acc: {train_acc:.4f}")
+            print(f"  Train - Loss: {train_loss_avg:.4f}, Acc: {train_acc:.4f}, LR: {scheduler.get_last_lr()[0]:.7f}")
             print(f"  Val   - Loss: {val_loss_avg:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
             print(f"  Val   - Precision: {val_precision:.4f}, Recall: {val_recall:.4f}")
             
         except ImportError:
             print(f"Epoch {epoch}:")
-            print(f"  Train - Loss: {train_loss_avg:.4f}, Acc: {train_acc:.4f}")
+            print(f"  Train - Loss: {train_loss_avg:.4f}, Acc: {train_acc:.4f}, LR: {scheduler.get_last_lr()[0]:.7f}")
             print(f"  Val   - Loss: {val_loss_avg:.4f}, Acc: {val_acc:.4f}")
             print("  (Install sklearn for AUC/Precision/Recall metrics)")
         

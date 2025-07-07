@@ -29,7 +29,7 @@ from implementations.gnn import train_model as train_gnn_model
 
 # Train your model.
 def train_model(data_folder, model_folder, verbose):
-    train_gnn_model(data_folder, 512, device='cuda:1')
+    train_gnn_model(data_folder, 256, device='cuda:0')
 
 # Load your trained models. This function is *required*. You should edit this function to add your code, but do *not* change the
 # arguments of this function. If you do not train one of the models, then you can return None for the model.
