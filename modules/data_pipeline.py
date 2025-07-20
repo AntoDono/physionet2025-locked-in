@@ -15,6 +15,8 @@ try:
 except ImportError:
     from .normalize_wave import normalize_amplitude, wavelet_denoising, trim_signal, pad_signal
 
+from scipy import signal  # Added for signal resampling
+
 def data_stats(df):
     """
     Print statistics about the data
@@ -30,7 +32,7 @@ def data_stats(df):
     print(f"Ratio: {df[df['label'] == 1].shape[0] / df[df['label'] == 0].shape[0]:.2f}")
     print("=" * 60)
     
-def load_data(path="./data", num_records=None, use_cache=True, sequence_length=512):
+def load_data(path="./data", name="data", num_records=None, use_cache=True, sequence_length=512):
     """
     Load the data from the path
     
@@ -43,7 +45,7 @@ def load_data(path="./data", num_records=None, use_cache=True, sequence_length=5
     """
     
     if os.path.exists("saved_data") and use_cache:
-        df = pd.read_pickle("./saved_data/data.pkl")
+        df = pd.read_pickle(f"./saved_data/{name}.pkl")
         if num_records is not None:
             df = df.sample(num_records, random_state=42)
         data_stats(df)
@@ -81,6 +83,7 @@ def load_data(path="./data", num_records=None, use_cache=True, sequence_length=5
             
             reordered_signal = reorder_signal(signal, signal_names, ["I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6"])
             data.append({
+                "id": record,
                 "label": label, 
                 "age": age, 
                 "sex": sex, 
@@ -99,28 +102,203 @@ def load_data(path="./data", num_records=None, use_cache=True, sequence_length=5
         
     df = pd.DataFrame(data)
     df = batch_normalize_data(df, length=sequence_length)
-    df.to_pickle("./saved_data/data.pkl")
+    df.to_pickle(f"./saved_data/{name}.pkl")
     data_stats(df)
     return df
 
-def batch_normalize_data(df, length=512):
+def batch_normalize_data(df, length=512, target_frequency=400):
+    """
+    Resample each ECG signal to a common sampling frequency, then normalize, trim, and pad it.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing a column ``signal`` with ECG data and a column ``frequency``
+                           with the original sampling frequency of each record.
+        length (int, optional): Desired number of samples after trimming (before optional padding). Default 512.
+        target_frequency (int, optional): Target sampling frequency in Hz. Default 400 Hz.
+
+    Returns:
+        pd.DataFrame: DataFrame with the ``signal`` column updated to the resampled, normalized, trimmed, and padded signals.
+    """
+
     pbar = tqdm(range(len(df)))
-    pbar.set_description("Normalizing Denoising Padding Data")
+    pbar.set_description("Resampling Normalizing Denoising Padding Data")
+
     for i in pbar:
-        # Convert to numpy array if it isn't already
-        signal = df.iloc[i]['signal'] # Signal is in (# samples, # leads) format
-        
-        # Apply normalization and denoising
-        # signal = wavelet_denoising(signal) # this shit is so ass :sob:
-        signal = normalize_amplitude(signal)
-        signal = trim_signal(signal, length)
-        signal = pad_signal(signal, length)
-        
-        # Assign back to dataframe using .at for proper assignment
-        df.at[i, 'signal'] = signal
+        # Retrieve signal and its original sampling frequency
+        ecg_signal = df.iloc[i]['signal']  # shape: (samples, leads)
+        orig_freq = df.iloc[i].get('frequency', None)
+
+        # If frequency information is available and different, resample
+        if orig_freq and not np.isnan(orig_freq) and orig_freq != target_frequency:
+            num_samples = ecg_signal.shape[0]
+            target_samples = int(round(num_samples * target_frequency / orig_freq))
+            # Resample along the time axis (axis 0)
+            ecg_signal = signal.resample(ecg_signal, target_samples, axis=0)
+            pbar.set_description(f"Resampling from {orig_freq} Hz to {target_frequency} Hz")
+
+        # Apply amplitude normalization
+        ecg_signal = normalize_amplitude(ecg_signal)
+
+        # Trim and pad to fixed length
+        ecg_signal = trim_signal(ecg_signal, length)
+        ecg_signal = pad_signal(ecg_signal, length)
+
+        # Save back to DataFrame
+        df.at[i, 'signal'] = ecg_signal
+
     return df
 
-def balance_data(df, strategy='oversample', num_records=None):
+def generate_masked_ecg(row, *, num_lead_masks: int = 1, num_span_masks: int = 1,
+                        lead_mask_ratio: float = 0.25, span_length: int | None = None,
+                        span_mask_ratio: float = 0.1, mask_value: float = 0.0,
+                        copy_row: bool = True):
+    """Generate masked ECG samples (lead‐masking and span‐masking) from one DataFrame row.
+
+    Given a single row coming _after_ ``batch_normalize_data`` (thus containing a
+    fixed-length, fully-processed ``signal`` ndarray), this utility creates
+    several augmented versions of that signal by masking either complete leads
+    (columns) or contiguous spans along the time axis.
+
+    Args:
+        row (pd.Series): A row produced by ``batch_normalize_data`` that at
+            minimum includes a ``signal`` field containing a 2-D ndarray of
+            shape (samples, leads).
+        num_lead_masks (int, optional): How many lead-masked samples to
+            generate from the input row. Default 1.
+        num_span_masks (int, optional): How many span-masked samples to
+            generate from the input row. Default 1.
+        lead_mask_ratio (float, optional): Fraction of the total leads to mask
+            in each lead-masked sample. At least one lead will always be masked.
+            Default 0.25 (25 %).
+        span_length (int | None, optional): Exact length (in samples) of the
+            contiguous time span to mask for span-masking. If *None*, the span
+            length is derived from ``span_mask_ratio`` instead. Default None.
+        span_mask_ratio (float, optional): When ``span_length`` is *None*, this
+            parameter specifies the fraction of the total signal length to mask
+            along the time axis. Default 0.10 (10 %).
+        mask_value (float, optional): The value used to fill the masked
+            elements. Default 0.0.
+        copy_row (bool, optional): Whether to copy non-signal fields when
+            building the masked samples. Set to *True* if you intend to append
+            the returned samples back into a DataFrame; *False* returns only
+            the modified signals. Default True.
+
+    Returns:
+        list[dict | np.ndarray]: A list containing the newly-generated masked
+            samples. By default each element is a ``dict`` mirroring the input
+            row with an updated ``signal`` entry plus metadata about the mask
+            that was applied. If ``copy_row`` is *False* the list will instead
+            contain masked ``np.ndarray`` objects.
+    """
+
+    # Extract original signal and basic dimensions
+    original_signal = row['signal']
+    if original_signal is None:
+        raise ValueError("Row must contain a 'signal' field with ECG data.")
+
+    # Ensure we are working with a NumPy array
+    signal_array = np.asarray(original_signal)
+    if signal_array.ndim != 2:
+        raise ValueError("'signal' must be a 2-D array of shape (samples, leads).")
+
+    num_samples, num_leads = signal_array.shape
+    masked_samples = []
+
+    # ---------- Lead masking ----------
+    if num_lead_masks > 0 and lead_mask_ratio > 0:
+        n_mask_leads = max(1, int(round(num_leads * lead_mask_ratio)))
+        for _ in range(num_lead_masks):
+            masked = signal_array.copy()
+            leads_to_mask = np.random.choice(num_leads, n_mask_leads, replace=False)
+            masked[:, leads_to_mask] = mask_value
+
+            if copy_row:
+                sample = row.to_dict()
+                sample['signal'] = masked
+                sample['mask_type'] = 'lead'
+                sample['masked_leads'] = leads_to_mask.tolist()
+                masked_samples.append(sample)
+            else:
+                masked_samples.append(masked)
+
+    # ---------- Span masking ----------
+    if num_span_masks > 0 and (span_length or span_mask_ratio):
+        if span_length is None:
+            span_length = max(1, int(round(num_samples * span_mask_ratio)))
+        span_length = min(span_length, num_samples)
+
+        for _ in range(num_span_masks):
+            masked = signal_array.copy()
+            start_idx = np.random.randint(0, num_samples - span_length + 1)
+            end_idx = start_idx + span_length
+            masked[start_idx:end_idx, :] = mask_value
+
+            if copy_row:
+                sample = row.to_dict()
+                sample['signal'] = masked
+                sample['mask_type'] = 'span'
+                sample['masked_span'] = (int(start_idx), int(end_idx))
+                masked_samples.append(sample)
+            else:
+                masked_samples.append(masked)
+
+    return masked_samples
+
+def mask_ecg(df: pd.DataFrame, *, num_lead_masks: int = 1, num_span_masks: int = 1,
+             lead_mask_ratio: float = 0.25, span_length: int | None = None,
+             span_mask_ratio: float = 0.1, mask_value: float = 0.0, include_original: bool = True) -> pd.DataFrame:
+    """Augment an ECG DataFrame by applying lead and/or span masking to every row.
+
+    This function iterates over *df*, generates masked variants for each row via
+    ``generate_masked_ecg``, and returns a new DataFrame containing both the
+    original rows and all newly created masked rows.
+
+    Parameters mirror those of ``generate_masked_ecg`` and are forwarded as-is.
+
+    Args:
+        df (pd.DataFrame): DataFrame that has already been processed by
+            ``batch_normalize_data``.
+        num_lead_masks, num_span_masks, lead_mask_ratio, span_length,
+        span_mask_ratio, mask_value: See ``generate_masked_ecg``.
+
+    Returns:
+        pd.DataFrame: Concatenation of the original *df* and the generated
+        masked samples (rows are shuffled for randomness).
+    """
+
+    if 'signal' not in df.columns:
+        raise ValueError("Input DataFrame must contain a 'signal' column. Make sure to run batch_normalize_data first.")
+
+    augmented_rows = []
+    pbar = tqdm(df.iterrows(), total=len(df), desc="Masking ECG data")
+
+    for _, row in pbar:
+        # Save original row (add explicit mask_type for clarity)
+        orig_row = row.to_dict()
+        orig_row.setdefault('mask_type', 'original')
+        
+        if include_original:
+            augmented_rows.append(orig_row)
+
+        # Generate masked variants
+        masked_variants = generate_masked_ecg(
+            row,
+            num_lead_masks=num_lead_masks,
+            num_span_masks=num_span_masks,
+            lead_mask_ratio=lead_mask_ratio,
+            span_length=span_length,
+            span_mask_ratio=span_mask_ratio,
+            mask_value=mask_value,
+            copy_row=True,
+        )
+        augmented_rows.extend(masked_variants)
+
+    augmented_df = pd.DataFrame(augmented_rows)
+    # Shuffle rows to mix originals and masks
+    augmented_df = augmented_df.sample(frac=1, random_state=42).reset_index(drop=True)
+    return augmented_df
+
+def balance_data(df, strategy='oversample', num_records=None, ratio=1):
     """
     Balance the data by either over-sampling the minority class or
     down-sampling the majority class.
@@ -131,6 +309,11 @@ def balance_data(df, strategy='oversample', num_records=None):
     Args:
         df (pd.DataFrame): The input dataframe.
         strategy (str): 'oversample' or 'downsample'.
+        num_records (int, optional): Total number of records to sample after balancing.
+        ratio (float): The negative to positive ratio. Default is 1 (balanced).
+                      For 'downsample': controls how many times larger the majority class 
+                      should be compared to the minority class.
+                      For 'oversample': always uses ratio=1 (balanced) regardless of input.
     
     Returns:
         pd.DataFrame: A balanced dataframe.
@@ -138,7 +321,7 @@ def balance_data(df, strategy='oversample', num_records=None):
     df_1 = df[df['label'] == 1]
     df_0 = df[df['label'] == 0]
 
-    if len(df_1) == len(df_0):
+    if len(df_1) == len(df_0) and ratio == 1:
         return df.copy()
 
     if len(df_1) > len(df_0):
@@ -151,6 +334,9 @@ def balance_data(df, strategy='oversample', num_records=None):
         return df
 
     if strategy == 'oversample':
+        if ratio != 1:
+            print(f"WARNING: ratio parameter ({ratio}) is ignored for oversampling. Using balanced ratio=1.")
+        
         imbalance_ratio = len(majority_df) / len(minority_df)
         if imbalance_ratio > 10:
             print("\n" + "!"*60)
@@ -164,7 +350,19 @@ def balance_data(df, strategy='oversample', num_records=None):
         balanced_df = pd.concat([majority_df, resampled_minority])
     
     elif strategy == 'downsample':
-        resampled_majority = majority_df.sample(len(minority_df), replace=False, random_state=42)
+        # Calculate target sizes based on ratio
+        minority_size = len(minority_df)
+        majority_target_size = int(minority_size * ratio)
+        
+        # Ensure we don't try to sample more than what's available
+        if majority_target_size > len(majority_df):
+            print(f"WARNING: Requested ratio ({ratio}) would require {majority_target_size} majority samples, ")
+            print(f"but only {len(majority_df)} available. Using all available majority samples.")
+            majority_target_size = len(majority_df)
+            actual_ratio = majority_target_size / minority_size
+            print(f"Actual ratio will be: {actual_ratio:.2f}")
+        
+        resampled_majority = majority_df.sample(majority_target_size, replace=False, random_state=42)
         balanced_df = pd.concat([resampled_majority, minority_df])
         
     else:

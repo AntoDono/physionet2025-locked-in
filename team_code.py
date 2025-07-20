@@ -29,7 +29,40 @@ from implementations.gnn import train_model as train_gnn_model
 
 # Train your model.
 def train_model(data_folder, model_folder, verbose):
-    train_gnn_model(data_folder, 256, device='cuda:0')
+    
+    ### PRETRAIN CONFIG
+    # train_gnn_model(
+    #     training_data_folder=data_folder, 
+    #     model_folder=model_folder, 
+    #     sequence_length=512, 
+    #     dropout=0.1,
+    #     epochs=100,
+    #     lr=5e-4,
+    #     batch_size=256,
+    #     generate_holdout=True, # if we disable this, we use the actual holdout data, which is the chagas dataset
+    #     device='cuda:0', 
+    #     model_path=None,
+    #     false_negative_penalty=1.0,
+    #     finetune=False,
+    #     train_verbose=verbose,
+    # )
+    
+    ### FINE TUNE CONFIG
+    train_gnn_model(
+        training_data_folder=data_folder, 
+        model_folder=model_folder, 
+        sequence_length=512, 
+        dropout=0.1,
+        epochs=15,
+        lr=5e-4,
+        batch_size=256,
+        generate_holdout=False, # if we disable this, we use the actual holdout data, which is the chagas dataset
+        device='cuda:0', 
+        model_path="./model/gnn_pretrain_94_acc_0.12_loss_512_256_32_16.pkl",
+        finetune=True,
+        false_negative_penalty=1.0,
+        train_verbose=verbose,
+    )
 
 # Load your trained models. This function is *required*. You should edit this function to add your code, but do *not* change the
 # arguments of this function. If you do not train one of the models, then you can return None for the model.

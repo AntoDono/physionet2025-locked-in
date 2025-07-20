@@ -10,10 +10,12 @@ from pathlib import Path
 import sys
 from tqdm import tqdm
 import pandas as pd
+from sklearn.metrics import roc_auc_score, precision_score, recall_score
+
 # Add parent directory to path to access modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.data_pipeline import load_data, batch_normalize_data, balance_data, data_stats
+from modules.data_pipeline import load_data, balance_data, mask_ecg, data_stats
 from modules.normalize_wave import normalize_amplitude, wavelet_denoising, trim_signal, pad_signal
 from helper_code import reorder_signal, get_signal_names, load_header, load_signals
 
@@ -45,6 +47,30 @@ class LeadEncoder(nn.Module):
         # collapse time → node embedding
         self.pool = nn.AdaptiveAvgPool1d(1)   # → [64 × 1]
         self.proj = nn.Linear(64, node_dim)   # → [node_dim]
+        
+    def train_mode(self):
+        # Unfreeze and train all components
+        for p in self.cnn.parameters():
+            p.requires_grad = True
+        for p in self.pool.parameters():
+            p.requires_grad = True
+        for p in self.proj.parameters():
+            p.requires_grad = True
+        self.cnn.train()
+        self.pool.train()
+        self.proj.train()
+        
+    def finetune_mode(self):
+        # Freeze and eval all components
+        for p in self.cnn.parameters():
+            p.requires_grad = False
+        for p in self.pool.parameters():
+            p.requires_grad = False
+        for p in self.proj.parameters():
+            p.requires_grad = False
+        self.cnn.eval()
+        self.pool.eval()
+        self.proj.eval()
     
     def forward(self, x):
         # x: [B × 1 × L]
@@ -67,6 +93,8 @@ class ECGGATModel(nn.Module):
                  num_classes=1):     # Binary classification
         super(ECGGATModel, self).__init__()
         
+        self.is_finetune = False
+        
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.dropout = dropout
@@ -74,6 +102,20 @@ class ECGGATModel(nn.Module):
         # GAT layers - simplified and fixed
         self.gat1 = GATConv(input_dim, hidden_dim, heads=num_heads, dropout=dropout, concat=True)
         self.gat2 = GATConv(hidden_dim * num_heads, hidden_dim, heads=1, dropout=dropout, concat=False)
+        
+        # Finetune block - complex residual adaptation
+        self.finetune_block = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim * 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 4, hidden_dim * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, hidden_dim)
+        )
         
         # Simple classification head
         self.classifier = nn.Sequential(
@@ -95,6 +137,15 @@ class ECGGATModel(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
     
+    def load_state_dict_flexible(self, state_dict):
+        """Load state dict while ignoring finetune_block mismatches"""
+        # Filter out finetune_block keys from loaded state_dict
+        filtered_state_dict = {k: v for k, v in state_dict.items() if not k.startswith('finetune_block')}
+        
+        # Load everything except finetune_block
+        self.load_state_dict(filtered_state_dict, strict=False)
+        print("Loaded model state (ignoring finetune_block for compatibility)")
+    
     def create_fully_connected_edges(self, num_nodes=12):
         """Create fully connected graph edges for 12 ECG leads"""
         edges = []
@@ -104,6 +155,42 @@ class ECGGATModel(nn.Module):
                     edges.append([i, j])
         
         return torch.tensor(edges, dtype=torch.long).t()  # Shape: [2, num_edges]
+    
+    def finetune_mode(self):
+        # Freeze GAT layers
+        for p in self.gat1.parameters():
+            p.requires_grad = False
+        for p in self.gat2.parameters():
+            p.requires_grad = False
+        self.gat1.eval()
+        self.gat2.eval()
+
+        # Enable finetune block
+        for p in self.finetune_block.parameters():
+            p.requires_grad = True
+        self.finetune_block.train()
+
+        # Leave classifier trainable
+        self.classifier.train()
+        self.is_finetune = True
+        
+    def train_mode(self):
+        # Unfreeze GAT layers
+        for p in self.gat1.parameters():
+            p.requires_grad = True
+        for p in self.gat2.parameters():
+            p.requires_grad = True
+        self.gat1.train()
+        self.gat2.train()
+
+        # Freeze finetune block in normal training
+        for p in self.finetune_block.parameters():
+            p.requires_grad = False
+        self.finetune_block.eval()
+
+        # Leave classifier trainable
+        self.classifier.train()
+        self.is_finetune = False
     
     def forward(self, node_features, edge_index=None, batch=None, return_attention=False):
         """
@@ -146,6 +233,10 @@ class ECGGATModel(nn.Module):
         
         # Global mean pooling to get graph-level representation
         graph_repr = global_mean_pool(x, batch)  # [batch_size, hidden_dim]
+        
+        # Apply finetune block if in finetune mode
+        if self.is_finetune:
+            graph_repr = graph_repr + self.finetune_block(graph_repr)
         
         # Classification
         logits = self.classifier(graph_repr)  # [batch_size, num_classes]
@@ -208,7 +299,27 @@ class ECGChagas(nn.Module):
         
         # Pass through GAT
         return self.gat(node_features, return_attention=return_attention)
-
+    
+    def finetune_mode(self):
+        """Set model to finetune mode - only classifier trains"""
+        self.lead_encoder.finetune_mode()
+        self.gat.train_mode()
+        print("Setting model to finetune mode - only classifier trains")
+        
+    def train_mode(self):
+        """Set model to full training mode - all components train"""
+        self.lead_encoder.train_mode()
+        self.gat.train_mode()
+        print("Setting model to train mode - all components train")
+    
+    def load_state_dict_flexible(self, state_dict):
+        """Load state dict while ignoring finetune_block mismatches"""
+        # Filter out finetune_block keys from loaded state_dict  
+        filtered_state_dict = {k: v for k, v in state_dict.items() if not k.startswith('gat.finetune_block')}
+        
+        # Load everything except finetune_block
+        self.load_state_dict(filtered_state_dict, strict=False)
+        print("Loaded complete model state (ignoring gat.finetune_block for compatibility)")
 # ============================================================================
 # DATASET FROM DATAFRAME
 # ============================================================================
@@ -226,12 +337,68 @@ class ECGDatasetFromPipeline(Dataset):
         label = row['label']
         
         return torch.FloatTensor(ecg_data), torch.FloatTensor([label])
+    
+# ============================================================================
+# Focal Loss Definition
+# ============================================================================
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for binary classification tasks.
+    
+    Args:
+        alpha (float): balancing factor for positive class in [0,1] (default = 0.25).
+            - alpha weights the positive class
+            - (1-alpha) weights the negative class
+        gamma (float): focusing parameter ≥ 0 (default = 2).
+            - Higher gamma puts more focus on hard examples
+        reduction (str): 'none' | 'mean' | 'sum' (default = 'mean').
+    """
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        self.alpha = torch.tensor([alpha], dtype=torch.float32)
+
+    def forward(self, inputs, targets):
+        """
+        inputs: predictions (logits) with shape (N,) or (N, 1) for binary classification
+        targets: ground-truth labels with shape (N,) (0 or 1 values)
+        """
+        # Move alpha to same device as inputs
+        self.alpha = self.alpha.to(inputs.device)
+        
+        # Flatten predictions and targets
+        logits = inputs.view(-1)
+        y = targets.view(-1).float()
+        
+        # Get probabilities using sigmoid
+        p = torch.sigmoid(logits)
+        
+        # Compute p_t (probability of true class)
+        pt = p * y + (1 - p) * (1 - y)
+        
+        # Alpha weighting: alpha for positive class, (1-alpha) for negative class
+        alpha_factor = self.alpha[0] * y + (1 - self.alpha[0]) * (1 - y)
+        
+        # Focal loss formula: -α * (1 - p_t)^γ * log(p_t)
+        loss = -alpha_factor * (1 - pt).pow(self.gamma) * torch.log(pt + 1e-8)
+        
+        # Apply reduction
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
 
 # ============================================================================
 # SIMPLE TRAINING FUNCTION WITH VALIDATION
 # ============================================================================
 
-def train_model(training_data_folder, sequence_length=1024, device='cpu'):
+def train_model(training_data_folder, model_folder, sequence_length=1024, dropout=0.1, 
+                epochs=15, lr=0.002, batch_size=32, device='cpu', train_verbose=True, 
+                generate_holdout=False, model_path=None, false_negative_penalty=1.0,
+                finetune=False):
     """
     Simple training function that takes a folder and trains the model.
     Includes train/validation split and performance metrics.
@@ -240,40 +407,43 @@ def train_model(training_data_folder, sequence_length=1024, device='cpu'):
         training_data_folder: Path to folder with .dat/.hea files
         sequence_length: The length to pad/trim signals to.
     """
+    final_stats = {'precision': 0, 'recall': 0, 'auc': 0, 'accuracy': 0, 'loss': 0}
     
     print("Loading data using data pipeline...")
-    df = load_data(path=training_data_folder, use_cache=True, sequence_length=sequence_length)
+    df = load_data(path=training_data_folder, name=f"{training_data_folder.replace('/', '-').replace('.', '-')}", 
+                   use_cache=True, sequence_length=sequence_length)
     
-    # Create hold-out validation set with 100 positive and 100 negative samples
-    positive_df = df[df['label'] == 1]
-    negative_df = df[df['label'] == 0]
-    
-    # Sample 100 from each class for validation, this is holdout validation
-    val_positive = positive_df.sample(n=min(100, len(positive_df)), random_state=42)
-    val_negative = negative_df.sample(n=min(100, len(negative_df)), random_state=42)
-    
-    # Combine to create validation set
-    val_df = pd.concat([val_positive, val_negative])
-    print("Validation set:")
-    data_stats(val_df)
-    
-    # Remove validation samples from main dataset
-    remaining_indices = df.index.difference(val_df.index)
-    train_df = df.loc[remaining_indices]
-    
-    # Balance only the training data
-    print("Training set:")
-    train_df = balance_data(train_df, strategy='oversample')
+    if generate_holdout:
+        negative_rows = df[df['label'] == 0].sample(n=100)
+        positive_rows = df[df['label'] == 1].sample(n=100)
+        val_df = pd.concat([negative_rows, positive_rows])
+        val_ids = val_df['id'].tolist()
+        df = df[~df['id'].isin(val_ids)]
+    else:
+        val_df = load_data(path="./holdout_data", name="holdout-data", use_cache=False, sequence_length=sequence_length)
+        val_ids = val_df['id'].tolist()
+        df = df[~df['id'].isin(val_ids)] # removes the validation set from the training set
     
     # Create datasets
-    train_dataset = ECGDatasetFromPipeline(train_df)
+    df = balance_data(df, strategy="downsample", ratio=1)
+    
+    df = mask_ecg(df, num_lead_masks=2, num_span_masks=2, 
+                  lead_mask_ratio=0.25, span_length=None, 
+                  span_mask_ratio=0.2, mask_value=0.0)
+    
+    data_stats(df)
+    
+    train_dataset = ECGDatasetFromPipeline(df)
     val_dataset = ECGDatasetFromPipeline(val_df)
     
-    print(f"Training on {len(train_dataset)} records (after balancing), validating on {len(val_dataset)} records")
+    del df
+    
+    if train_verbose:
+        print(f"Training on {len(train_dataset)} records (after balancing), validating on {len(val_dataset)} records")
     
     # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=512, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size * 2, shuffle=False)
     
     # Check label distribution
     print("Checking label distribution...")
@@ -287,21 +457,32 @@ def train_model(training_data_folder, sequence_length=1024, device='cpu'):
     
     # Initialize model
     device = torch.device(device)
-    print(f"Using device: {device}")
+    
+    if train_verbose:
+        print(f"Using device: {device}")
     
     model = ECGChagas(
-        cnn_node_dim=128,
-        gat_hidden_dim=64,
-        gat_heads=8,
-        gat_layers=2,
-        dropout=0.1
+        cnn_node_dim=512,
+        gat_hidden_dim=256,
+        gat_heads=32,
+        gat_layers=16,
+        dropout=dropout
     ).to(device)
+    
+    if model_path is not None:
+        state_dict = torch.load(model_path, map_location=device)
+        model.load_state_dict_flexible(state_dict)
+    
+    if finetune:
+        model.finetune_mode()
+    else:
+        model.train_mode()
     
     # Simple training setup
     criterion = nn.BCEWithLogitsLoss()
-    epochs = 15
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.002)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    best_loss = float('inf')
     
     print("Starting training...")
     
@@ -359,7 +540,7 @@ def train_model(training_data_folder, sequence_length=1024, device='cpu'):
             
             # Create weights: 1.5x negatives for false negatives and regular loss for everything else
             weights = torch.ones_like(labels)
-            weights[false_negatives] = 1.5
+            weights[false_negatives] = false_negative_penalty # Cost sensitive, using this to balance the classes
             
             # Calculate weighted loss
             loss = F.binary_cross_entropy_with_logits(logits, labels, weight=weights)
@@ -375,7 +556,7 @@ def train_model(training_data_folder, sequence_length=1024, device='cpu'):
             train_correct += (predictions == labels).sum().item()
             train_total += labels.size(0)
             
-            pbar.set_description(f"Epoch {epoch} - Loss: {loss.item():.4f}")
+            pbar.set_description(f"Epoch {epoch} - Loss: {loss.item():.7f}")
         
         # VALIDATION PHASE
         model.eval()
@@ -409,42 +590,53 @@ def train_model(training_data_folder, sequence_length=1024, device='cpu'):
         val_acc = val_correct / val_total
         train_loss_avg = train_loss / len(train_loader)
         val_loss_avg = val_loss / len(val_loader)
+
+        if val_loss_avg < best_loss:
+            best_loss = val_loss_avg
+            torch.save(model.state_dict(), os.path.join(model_folder, f'gnn_trained_model.pkl'))
+            print("*" * 50)
+            print(f"Best model saved to with loss {val_loss_avg:.7f} and acc {val_acc:.7f} saved at {os.path.join(model_folder, f'gnn_trained_model.pkl')}")
         
         # Step the learning rate scheduler
-        scheduler.step(val_loss_avg)
+        scheduler.step()
+        
+        val_auc = roc_auc_score(val_labels_list, val_predictions)
+        val_precision = precision_score(val_labels_list, [p > 0.5 for p in val_predictions])
+        val_recall = recall_score(val_labels_list, [p > 0.5 for p in val_predictions])
+        
+        # Update final stats
+        final_stats['loss'] = val_loss_avg
+        final_stats['accuracy'] = val_acc
+        final_stats['precision'] = val_precision
+        final_stats['recall'] = val_recall
+        final_stats['auc'] = val_auc
         
         # Calculate AUC if possible
-        try:
-            from sklearn.metrics import roc_auc_score, precision_score, recall_score
-            val_auc = roc_auc_score(val_labels_list, val_predictions)
-            val_precision = precision_score(val_labels_list, [p > 0.5 for p in val_predictions])
-            val_recall = recall_score(val_labels_list, [p > 0.5 for p in val_predictions])
+        if train_verbose:
+            try:
+                print(f"Epoch {epoch}:")
+                print(f"  Train - Loss: {train_loss_avg:.7f}, Acc: {train_acc:.7f}, LR: {scheduler.get_last_lr()[0]:.7f}")
+                print(f"  Val   - Loss: {val_loss_avg:.7f}, Acc: {val_acc:.7f}, AUC: {val_auc:.7f}")
+                print(f"  Val   - Precision: {val_precision:.7f}, Recall: {val_recall:.7f}")
+                
+            except ImportError:
+                print(f"Epoch {epoch}:")
+                print(f"  Train - Loss: {train_loss_avg:.7f}, Acc: {train_acc:.7f}, LR: {scheduler.get_last_lr()[0]:.7f}")
+                print(f"  Val   - Loss: {val_loss_avg:.7f}, Acc: {val_acc:.7f}")
+                print("  (Install sklearn for AUC/Precision/Recall metrics)")
             
-            print(f"Epoch {epoch}:")
-            print(f"  Train - Loss: {train_loss_avg:.4f}, Acc: {train_acc:.4f}, LR: {scheduler.get_last_lr()[0]:.7f}")
-            print(f"  Val   - Loss: {val_loss_avg:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
-            print(f"  Val   - Precision: {val_precision:.4f}, Recall: {val_recall:.4f}")
-            
-        except ImportError:
-            print(f"Epoch {epoch}:")
-            print(f"  Train - Loss: {train_loss_avg:.4f}, Acc: {train_acc:.4f}, LR: {scheduler.get_last_lr()[0]:.7f}")
-            print(f"  Val   - Loss: {val_loss_avg:.4f}, Acc: {val_acc:.4f}")
-            print("  (Install sklearn for AUC/Precision/Recall metrics)")
-        
-        print("-" * 50)
+            print("-" * 50)
     
     # Save model
-    model_path = os.path.join(training_data_folder, 'trained_model.pkl')
-    torch.save(model.state_dict(), model_path)
-    print(f"Model saved to {model_path}")
+    print(final_stats)
     
-    return model
+    return model, final_stats
 
 # ============================================================================
 # SIMPLE INFERENCE FUNCTION
 # ============================================================================
 
-def load_and_predict(model_path, record_path, sequence_length=512, device='cpu'):
+def load_model(model_path, device='cpu'):
     """
     Load model and predict on a single record.
     
@@ -458,35 +650,18 @@ def load_and_predict(model_path, record_path, sequence_length=512, device='cpu')
     
     # Load model with updated architecture
     model = ECGChagas(
-        cnn_node_dim=64,
-        gat_hidden_dim=32,
-        gat_heads=2,
-        gat_layers=2,
-        dropout=0.2
+        cnn_node_dim=512,
+        gat_hidden_dim=256,
+        gat_heads=32,
+        gat_layers=16,
+        dropout=0.1
     ).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict_flexible(state_dict)
     model.eval()
     
-    # Load and preprocess ECG signal using pipeline logic
-    header = load_header(record_path)
-    signal, _ = load_signals(record_path)
-    signal_names = get_signal_names(header)
-
-    signal = reorder_signal(signal, signal_names, ["I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6"])
-    
-    signal = normalize_amplitude(signal)
-    signal = wavelet_denoising(signal)
-    signal = trim_signal(signal, sequence_length)
-    ecg_data = pad_signal(signal, sequence_length)
-    
-    # Predict
-    with torch.no_grad():
-        ecg_tensor = torch.FloatTensor(ecg_data).unsqueeze(0).to(device)  # [1, sequence_length, 12]
-        logits = model(ecg_tensor)
-        probability = torch.sigmoid(logits).cpu().numpy()[0, 0]
-        binary_pred = int(probability > 0.3)
-    
-    return binary_pred, probability
+    return model
 
 # ============================================================================
 # USAGE EXAMPLE
@@ -494,5 +669,6 @@ def load_and_predict(model_path, record_path, sequence_length=512, device='cpu')
 
 if __name__ == "__main__":
     # Train
-    data_folder = "/Users/vivian/Desktop/updated_physionet/python-example-2025/training_data"
-    model = train_model(data_folder)
+    data_folder = "../data"
+    model, final_stats = train_model(data_folder)
+    print(final_stats)
