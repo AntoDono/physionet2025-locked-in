@@ -65,11 +65,12 @@ def binary_threshold_optimization(model, val_dataset, increments, device='cpu'):
 if __name__ == "__main__":
     print("Threshold Optimization on ECG GNN Model")
     
-    from implementations.gnn import load_model, ECGDatasetFromPipeline
+    # from implementations.gnn import load_model, ECGDatasetFromPipeline
+    from implementations.resnet_trans import load_model, ECGDatasetFromPipeline
     from modules.data_pipeline import load_data
     from torch.utils.data import DataLoader
     
-    model = load_model("model/gnn_trained_model.pkl", "cuda:0")
+    model = load_model("model/resnet_trans_trained_model.pkl", is_finetune=False, device="cuda:1")
     
     df = load_data("./holdout_data", "holdout-data", use_cache=False, sequence_length=512)
     val_dataset = ECGDatasetFromPipeline(df)
