@@ -352,10 +352,13 @@ class ECGChagas(nn.Module):
                  classifier_hidden_dim=256,
                  # General parameters
                  dropout=0.1,
-                 base_parameter=1.0):  # Scale factor for both modules
+                 base_parameter=1.0,
+                 device='cpu'):  # Scale factor for both modules
         super().__init__()
         
+        self.device = device
         self.is_finetune = False
+        self.threshold = None
         
         # Scale dimensions based on base_parameter
         transformer_d_model = int(transformer_d_model * base_parameter)
@@ -371,13 +374,13 @@ class ECGChagas(nn.Module):
             num_layers=transformer_layers,
             dim_feedforward=transformer_dim_feedforward,
             dropout=dropout
-        )
+        ).to(device)
         
         self.resnet = ResNetModule(
             base_channels=resnet_base_channels,
             num_blocks=resnet_num_blocks,
             dropout=dropout
-        )
+        ).to(device)
         
         self.classifier = Classifier(
             transformer_dim=transformer_d_model,
@@ -385,7 +388,7 @@ class ECGChagas(nn.Module):
             hidden_dim=classifier_hidden_dim,
             num_classes=1,
             dropout=dropout
-        )
+        ).to(device)
     
     def forward(self, ecg_data):
         """
@@ -403,8 +406,26 @@ class ECGChagas(nn.Module):
         
         # Pass through classifier
         logits = self.classifier(transformer_features, resnet_features)
-        
+
         return logits
+    
+    def predict(self, ecg_data):
+        
+        # Pass data through both modules in parallel
+        transformer_features = self.transformer(ecg_data, is_finetune=self.is_finetune)
+        resnet_features = self.resnet(ecg_data, is_finetune=self.is_finetune)
+        
+        # Pass through classifier
+        logits = self.classifier(transformer_features, resnet_features)
+        
+        probability = torch.sigmoid(logits)
+        
+        if self.threshold is not None:
+            binary = (probability > self.threshold).float() # returns 1 if logits > threshold, 0 otherwise
+        else:
+            binary = (probability > 0.5).float() # returns 1 if probability > 0.5, 0 otherwise
+        
+        return binary, probability
     
     def finetune_mode(self):
         """Set model to finetune mode - only finetune blocks and classifier train"""
@@ -462,7 +483,8 @@ class ECGDatasetFromPipeline(Dataset):
 def train_model(training_data_folder, model_folder, sequence_length=1024, dropout=0.1, 
                 epochs=15, lr=0.002, batch_size=32, device='cpu', train_verbose=True, 
                 generate_holdout=False, model_path=None, false_negative_penalty=1.0,
-                finetune=False, aggressive_masking=False, alternate_finetune=False):
+                finetune=False, aggressive_masking=False, alternate_finetune=False, 
+                pretrain_transformer_only=False):
     """
     Simple training function that takes a folder and trains the model.
     Includes train/validation split and performance metrics.
@@ -550,6 +572,14 @@ def train_model(training_data_folder, model_folder, sequence_length=1024, dropou
     
     if finetune:
         model.finetune_mode()
+    elif pretrain_transformer_only:
+        # Freeze ResNet, only train transformer and classifier
+        for p in model.resnet.parameters():
+            p.requires_grad = False
+        model.resnet.eval()
+        model.transformer.train()
+        model.classifier.train()
+        print("Pretraining transformer only - ResNet frozen")
     else:
         model.train_mode()
     
@@ -626,6 +656,7 @@ def train_model(training_data_folder, model_folder, sequence_length=1024, dropou
             
             optimizer.zero_grad()
             logits = model(ecg_data)
+            print(ecg_data.shape)
             
             # ===================================
             ## DOUBLE PENALITY FOR FALSE NEGATIVES
@@ -758,7 +789,8 @@ def load_model(model_path, is_finetune=False, device='cpu'):
         resnet_num_blocks=[2, 2, 2, 2],
         classifier_hidden_dim=128,
         dropout=0.1,
-        base_parameter=1.0
+        base_parameter=1.0,
+        device=device
     ).to(device)
     
     state_dict = torch.load(model_path, map_location=device)
@@ -767,6 +799,16 @@ def load_model(model_path, is_finetune=False, device='cpu'):
         model.finetune_mode()
     else:
         model.train_mode()
+        
+    from modules.threshold_optimization import binary_threshold_optimization
+    df = load_data("./holdout_data", "holdout-data", use_cache=False, sequence_length=512)
+    val_dataset = ECGDatasetFromPipeline(df)
+    val_dataset = DataLoader(val_dataset, batch_size=128, shuffle=False)
+    
+    best_threshold, best_accuracy = binary_threshold_optimization(model, val_dataset, 0.001, device='cuda:0')
+    model.threshold = best_threshold
+    
+    print(f"Best threshold: {best_threshold} | Accuracy: {best_accuracy}")
     
     return model
 

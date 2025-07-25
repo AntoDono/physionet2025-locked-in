@@ -398,7 +398,7 @@ class FocalLoss(nn.Module):
 def train_model(training_data_folder, model_folder, sequence_length=1024, dropout=0.1, 
                 epochs=15, lr=0.002, batch_size=32, device='cpu', train_verbose=True, 
                 generate_holdout=False, model_path=None, false_negative_penalty=1.0,
-                finetune=False):
+                finetune=False, aggressive_masking=False, alternate_finetune=False):
     """
     Simple training function that takes a folder and trains the model.
     Includes train/validation split and performance metrics.
@@ -406,6 +406,7 @@ def train_model(training_data_folder, model_folder, sequence_length=1024, dropou
     Args:
         training_data_folder: Path to folder with .dat/.hea files
         sequence_length: The length to pad/trim signals to.
+        aggressive_masking: If True, re-mask the data each epoch for different masking patterns
     """
     final_stats = {'precision': 0, 'recall': 0, 'auc': 0, 'accuracy': 0, 'loss': 0}
     
@@ -426,6 +427,11 @@ def train_model(training_data_folder, model_folder, sequence_length=1024, dropou
     
     # Create datasets
     df = balance_data(df, strategy="downsample", ratio=1)
+    
+    # Store the balanced but unmasked df for aggressive masking
+    if aggressive_masking:
+        df_unmasked = df.copy()
+        print("Aggressive masking enabled - data will be re-masked each epoch")
     
     df = mask_ecg(df, num_lead_masks=2, num_span_masks=2, 
                   lead_mask_ratio=0.25, span_length=None, 
@@ -486,13 +492,37 @@ def train_model(training_data_folder, model_folder, sequence_length=1024, dropou
     
     print("Starting training...")
     
-    # Train for 10 epochs
+    # Train for epochs
     for epoch in range(epochs):
+        # Re-mask data each epoch if aggressive masking is enabled
+        # lead_mask_ratio = np.random.uniform(0.2, 0.5)
+        # span_mask_ratio = np.random.uniform(0.2, 0.5)
+        lead_mask_ratio = 0.5
+        span_mask_ratio = 0.5
+        if aggressive_masking:
+            df_epoch = mask_ecg(df_unmasked.copy(), num_lead_masks=1, num_span_masks=1, 
+                              lead_mask_ratio=lead_mask_ratio, span_length=None, 
+                              span_mask_ratio=span_mask_ratio, mask_value=0.0, include_original=False)
+            train_dataset = ECGDatasetFromPipeline(df_epoch)
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+            if train_verbose:
+                print(f"Epoch {epoch}: Aggressive masking - Re-masked data with new patterns")
+                print(f"  Lead mask ratio: {lead_mask_ratio}")
+                print(f"  Span mask ratio: {span_mask_ratio}")
+        
         # TRAINING PHASE
         model.train()
         train_loss = 0
         train_correct = 0
         train_total = 0
+        
+        if finetune and alternate_finetune:
+            if (epoch + 1) % 5 == 0:
+                model.train_mode()
+                print("Setting model to train mode - All components train")
+            else:
+                model.finetune_mode()
+                print("Setting model to finetune mode - Only finetune blocks and classifier train")
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         for batch_idx, (ecg_data, labels) in enumerate(pbar):
@@ -591,11 +621,21 @@ def train_model(training_data_folder, model_folder, sequence_length=1024, dropou
         train_loss_avg = train_loss / len(train_loader)
         val_loss_avg = val_loss / len(val_loader)
 
+        print(f"Validation loss: {val_loss_avg:.7f}, Best loss so far: {best_loss:.7f}")
+        
         if val_loss_avg < best_loss:
             best_loss = val_loss_avg
+            # Temporarily set to train mode to save all parameters
+            current_mode = model.is_finetune
+            model.train_mode()
             torch.save(model.state_dict(), os.path.join(model_folder, f'gnn_trained_model.pkl'))
+            # Restore original mode
+            if current_mode:
+                model.finetune_mode()
             print("*" * 50)
-            print(f"Best model saved to with loss {val_loss_avg:.7f} and acc {val_acc:.7f} saved at {os.path.join(model_folder, f'gnn_trained_model.pkl')}")
+            print(f"Best model saved with loss {val_loss_avg:.7f} and acc {val_acc:.7f} to {os.path.join(model_folder, f'gnn_trained_model.pkl')}")
+        else:
+            print(f"No improvement. Current: {val_loss_avg:.7f}, Best: {best_loss:.7f}")
         
         # Step the learning rate scheduler
         scheduler.step()

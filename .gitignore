@@ -3,6 +3,7 @@ venv
 saved_data
 
 __pycache__
-model/
 finetune-data/
 pretrain-data/
+run_output/
+saved_model/

@@ -31,7 +31,93 @@ def data_stats(df):
     print(f"Size: {len(df)} | Positives: {df[df['label'] == 1].shape[0]} | Negatives: {df[df['label'] == 0].shape[0]}")
     print(f"Ratio: {df[df['label'] == 1].shape[0] / df[df['label'] == 0].shape[0]:.2f}")
     print("=" * 60)
+
+def load_record(record_path, sequence_length=512):
+    """
+    Load a single record from the given path
     
+    Args:
+        record_path (str): The path to the record
+        sequence_length (int): The desired sequence length for normalization
+        
+    Returns:
+        dict: A dictionary containing the record data, or None if loading fails
+    """
+    try:
+        label = load_label(record_path)
+        header = load_header(record_path)
+        age = load_age(record_path)
+        sex = load_sex(record_path)
+        source = load_source(record_path)
+        signal, fields = load_signals(record_path)
+        num_leads = get_num_signals(header)
+        frequency = get_sampling_frequency(header)
+        signal_names = get_signal_names(header)
+        
+        # Extract record name from path
+        record_name = os.path.basename(record_path)
+        
+        reordered_signal = reorder_signal(signal, signal_names, ["I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6"])
+        
+        record_data = {
+            "id": record_name,
+            "label": label, 
+            "age": age, 
+            "sex": sex, 
+            "source": source, 
+            "num_leads": num_leads, 
+            "frequency": frequency, 
+            "signal_names": signal_names,
+            "signal": reordered_signal
+        }
+        
+        # Apply normalization to the single record
+        record_data = normalize_single_record(record_data, sequence_length)
+        # Apply amplitude normalization
+            
+        return record_data
+        
+    except FileNotFoundError:
+        print(f"File not found: {record_path}")
+        return None
+    except Exception as e:
+        print(f"Error loading record: {e}")
+        return None
+
+def normalize_single_record(record_data, length=512, target_frequency=400):
+    """
+    Normalize a single record's signal data
+    
+    Args:
+        record_data (dict): Dictionary containing record data with 'signal' and 'frequency' keys
+        length (int): Desired sequence length
+        target_frequency (int): Target sampling frequency in Hz
+        
+    Returns:
+        dict: Updated record data with normalized signal
+    """
+    ecg_signal = record_data['signal']
+    orig_freq = record_data.get('frequency', None)
+    
+    # If frequency information is available and different, resample
+    if orig_freq and not np.isnan(orig_freq) and orig_freq != target_frequency:
+        num_samples = ecg_signal.shape[0]
+        target_samples = int(round(num_samples * target_frequency / orig_freq))
+        # Resample along the time axis (axis 0)
+        ecg_signal = signal.resample(ecg_signal, target_samples, axis=0)
+    
+    # Apply amplitude normalization
+    ecg_signal = normalize_amplitude(ecg_signal)
+    
+    # Trim and pad to fixed length
+    ecg_signal = trim_signal(ecg_signal, length)
+    ecg_signal = pad_signal(ecg_signal, length)
+    
+    # Update the record data
+    record_data['signal'] = ecg_signal
+    
+    return record_data
+
 def load_data(path="./data", name="data", num_records=None, use_cache=True, sequence_length=512):
     """
     Load the data from the path

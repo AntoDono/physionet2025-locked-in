@@ -59,7 +59,7 @@ def binary_threshold_optimization(model, val_dataset, increments, device='cpu'):
         if accuracy > best_accuracy:
             best_accuracy = accuracy
             best_threshold = threshold
-    
+            
     return best_threshold, best_accuracy
 
 if __name__ == "__main__":
@@ -70,14 +70,5 @@ if __name__ == "__main__":
     from modules.data_pipeline import load_data
     from torch.utils.data import DataLoader
     
-    model = load_model("model/resnet_trans_trained_model.pkl", is_finetune=False, device="cuda:1")
-    
-    df = load_data("./holdout_data", "holdout-data", use_cache=False, sequence_length=512)
-    val_dataset = ECGDatasetFromPipeline(df)
-    val_dataset = DataLoader(val_dataset, batch_size=128, shuffle=False)
-    
-    best_threshold, best_accuracy = binary_threshold_optimization(model, val_dataset, 0.0001, device='cuda:0')
-    print("*" * 50)
-    print(f"Best threshold: {best_threshold} | Accuracy: {best_accuracy}")
-    print("*" * 50)
+    model = load_model("./model/model.pkl", is_finetune=False, device="cuda:1")
     

@@ -4,7 +4,7 @@
 
 # This file contains functions for training your model for the Challenge. You can run it as follows:
 #
-#   python train_model.py -d data -m model -v
+#   python train_model.py -d ./finetune-data -m model -v
 #
 # where 'data' is a folder containing the Challenge data, 'model' is a folder for saving your model, and , and -v is an optional
 # verbosity flag.
