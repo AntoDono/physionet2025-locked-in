@@ -47,7 +47,6 @@ def train_model(data_folder, model_folder, verbose):
     #     batch_size=128,
     #     generate_holdout=False, # if we disable this, we use the actual holdout data, which is the chagas dataset
     #     device='cuda:0', 
-    #     false_negative_penalty=1.0,
     #     finetune=False,
     #     train_verbose=verbose,
     #     aggressive_masking=True,  # Re-mask data each epoch for different patterns
@@ -65,7 +64,6 @@ def train_model(data_folder, model_folder, verbose):
     #     generate_holdout=False, # if we disable this, we use the actual holdout data, which is the chagas dataset
     #     device='cuda:0', 
     #     model_path=None,
-    #     false_negative_penalty=1.0,
     #     finetune=False,
     #     train_verbose=verbose,
     #     aggressive_masking=True,  # Re-mask data each epoch for different patterns
@@ -82,14 +80,13 @@ def train_model(data_folder, model_folder, verbose):
     #     generate_holdout=True, # if we disable this, we use the actual holdout data, which is the chagas dataset
     #     device='cuda:0', 
     #     model_path=None,
-    #     false_negative_penalty=1.0,
     #     finetune=False,
     #     train_verbose=verbose,
     #     aggressive_masking=True,  # Re-mask data each epoch for different patterns
     #     pretrain_transformer_only= True # Freeze ResNet, only train transformer and classifier
     # )
     
-    ### SUBMISSION TRAIN CONFIG
+    ### FINETUNE NO PRETRAIN
     train_resnet_trans_model(
         training_data_folder=data_folder, 
         model_folder=model_folder, 
@@ -100,14 +97,33 @@ def train_model(data_folder, model_folder, verbose):
         batch_size=128,
         generate_holdout=False, # if we disable this, we use the actual holdout data, which is the chagas dataset
         device='cuda:0', 
-        model_path="./model/model.pkl",
+        model_path=None,
         finetune=False,
         alternate_finetune=False,
-        false_negative_penalty=1.0,
         train_verbose=verbose,
         aggressive_masking=True,  # Re-mask data each epoch for different patterns
-        pretrain_transformer_only= False # Freeze ResNet, only train transformer and classifier
+        pretrain_transformer_only= False, # Freeze ResNet, only train transformer and classifier
+        false_negative_penalty=1.5 # Cost sensitive, using this to balance the classes
     )
+    
+    ### SUBMISSION TRAIN CONFIG
+    # train_resnet_trans_model(
+    #     training_data_folder=data_folder, 
+    #     model_folder=model_folder, 
+    #     sequence_length=512, 
+    #     dropout=0.1,
+    #     epochs=100,
+    #     lr=3e-5,
+    #     batch_size=128,
+    #     generate_holdout=False, # if we disable this, we use the actual holdout data, which is the chagas dataset
+    #     device='cuda:0', 
+    #     model_path="./model/model.pkl",
+    #     finetune=False,
+    #     alternate_finetune=False,
+    #     train_verbose=verbose,
+    #     aggressive_masking=True,  # Re-mask data each epoch for different patterns
+    #     pretrain_transformer_only= False # Freeze ResNet, only train transformer and classifier
+    # )
     
 
 # Load your trained models. This function is *required*. You should edit this function to add your code, but do *not* change the

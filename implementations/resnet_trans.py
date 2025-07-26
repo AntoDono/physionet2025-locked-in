@@ -10,12 +10,15 @@ import sys
 from tqdm import tqdm
 import pandas as pd
 from sklearn.metrics import roc_auc_score, precision_score, recall_score
+from sklearn.isotonic import IsotonicRegression
 import math
+import joblib
 
 # Add parent directory to path to access modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from modules.data_pipeline import load_data, balance_data, mask_ecg, data_stats
+from modules.diagnostic_script import diagnose_model_probabilities
 
 # ============================================================================
 # TRANSFORMER SUB-MODULE
@@ -359,6 +362,7 @@ class ECGChagas(nn.Module):
         self.device = device
         self.is_finetune = False
         self.threshold = None
+        # self.isotonic_regression = IsotonicRegression(out_of_bounds='clip') # Turns logits into actual probabilities
         
         # Scale dimensions based on base_parameter
         transformer_d_model = int(transformer_d_model * base_parameter)
@@ -418,12 +422,15 @@ class ECGChagas(nn.Module):
         # Pass through classifier
         logits = self.classifier(transformer_features, resnet_features)
         
-        probability = torch.sigmoid(logits)
+        # Convert logits to CPU numpy array for isotonic regression
+        logits_cpu = logits.detach().cpu().numpy().flatten()
+        # probability = self.isotonic_regression.transform(logits_cpu)
+        probability = torch.sigmoid(logits).detach().cpu().numpy().flatten()
         
         if self.threshold is not None:
-            binary = (probability > self.threshold).float() # returns 1 if logits > threshold, 0 otherwise
+            binary = (probability > self.threshold) # returns 1 if probability > threshold, 0 otherwise
         else:
-            binary = (probability > 0.5).float() # returns 1 if probability > 0.5, 0 otherwise
+            binary = (probability > 0.5) # returns 1 if probability > 0.5, 0 otherwise
         
         return binary, probability
     
@@ -482,9 +489,8 @@ class ECGDatasetFromPipeline(Dataset):
 
 def train_model(training_data_folder, model_folder, sequence_length=1024, dropout=0.1, 
                 epochs=15, lr=0.002, batch_size=32, device='cpu', train_verbose=True, 
-                generate_holdout=False, model_path=None, false_negative_penalty=1.0,
-                finetune=False, aggressive_masking=False, alternate_finetune=False, 
-                pretrain_transformer_only=False):
+                generate_holdout=False, model_path=None, finetune=False, aggressive_masking=False, 
+                alternate_finetune=False, pretrain_transformer_only=False, false_negative_penalty=1.0):
     """
     Simple training function that takes a folder and trains the model.
     Includes train/validation split and performance metrics.
@@ -514,18 +520,10 @@ def train_model(training_data_folder, model_folder, sequence_length=1024, dropou
     # Create datasets
     df = balance_data(df, strategy="downsample", ratio=1)
     
-    # Store the balanced but unmasked df for aggressive masking
-    if aggressive_masking:
-        df_unmasked = df.copy()
-        print("Aggressive masking enabled - data will be re-masked each epoch")
-    
-    df = mask_ecg(df, num_lead_masks=2, num_span_masks=2, 
-                  lead_mask_ratio=0.25, span_length=None, 
-                  span_mask_ratio=0.2, mask_value=0.0)
-    
     data_stats(df)
     
-    train_dataset = ECGDatasetFromPipeline(df)
+    df_copy = df.copy()
+    train_dataset = ECGDatasetFromPipeline(df_copy)
     val_dataset = ECGDatasetFromPipeline(val_df)
     
     del df
@@ -587,33 +585,32 @@ def train_model(training_data_folder, model_folder, sequence_length=1024, dropou
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    best_loss = float('inf')
+    best_challenge_score = 0
     
     print("Starting training...")
     
     # Train for epochs
     for epoch in range(epochs):
         # Re-mask data each epoch if aggressive masking is enabled
-        # lead_mask_ratio = np.random.uniform(0.2, 0.5)
-        # span_mask_ratio = np.random.uniform(0.2, 0.5)
-        lead_mask_ratio = 0.5
-        span_mask_ratio = 0.5
-        if aggressive_masking:
-            df_epoch = mask_ecg(df_unmasked.copy(), num_lead_masks=1, num_span_masks=1, 
-                              lead_mask_ratio=lead_mask_ratio, span_length=None, 
-                              span_mask_ratio=span_mask_ratio, mask_value=0.0, include_original=False)
-            train_dataset = ECGDatasetFromPipeline(df_epoch)
-            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-            if train_verbose:
-                print(f"Epoch {epoch}: Aggressive masking - Re-masked data with new patterns")
-                print(f"  Lead mask ratio: {lead_mask_ratio}")
-                print(f"  Span mask ratio: {span_mask_ratio}")
-        
         # TRAINING PHASE
+        print()
+        print("="*10 + f" NEW EPOCH " + "="*10)
         model.train()
         train_loss = 0
         train_correct = 0
         train_total = 0
+        
+        if aggressive_masking:
+            print("Aggressive masking enabled - data will be re-masked to generate more data")
+            lead_mask_ratio = 0.5
+            span_mask_ratio = 0.5
+            print(f"    - Lead mask ratio: {lead_mask_ratio}")
+            print(f"    - Span mask ratio: {span_mask_ratio}")
+            df = mask_ecg(df_copy, num_lead_masks=1, num_span_masks=1, 
+                        lead_mask_ratio=lead_mask_ratio, span_length=None, 
+                        span_mask_ratio=span_mask_ratio, mask_value=0.0, include_original=True)
+            train_dataset = ECGDatasetFromPipeline(df)
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         
         if finetune and alternate_finetune: # Alternate finetune mode
             if (epoch + 1) % 5 == 0:
@@ -622,6 +619,9 @@ def train_model(training_data_folder, model_folder, sequence_length=1024, dropou
             else:
                 model.finetune_mode()
                 print("Setting model to finetune mode - Only finetune blocks and classifier train")
+                
+        logits_for_iso = []
+        labels_for_iso = []
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         for batch_idx, (ecg_data, labels) in enumerate(pbar):
@@ -656,13 +656,14 @@ def train_model(training_data_folder, model_folder, sequence_length=1024, dropou
             
             optimizer.zero_grad()
             logits = model(ecg_data)
-            print(ecg_data.shape)
+            logits_for_iso.extend(logits.detach().cpu().numpy().flatten())
+            labels_for_iso.extend(labels.detach().cpu().numpy().flatten())
             
             # ===================================
-            ## DOUBLE PENALITY FOR FALSE NEGATIVES
+            ## WEIGHTED PENALITY FOR FALSE NEGATIVES
             # ===================================
             
-            # Calculate predictions for false negative detection
+             # Calculate predictions for false negative detection
             with torch.no_grad():
                 predictions = (torch.sigmoid(logits) > 0.5).float()
                 # False negatives: predicted 0, actual 1
@@ -674,7 +675,7 @@ def train_model(training_data_folder, model_folder, sequence_length=1024, dropou
             
             # Calculate weighted loss
             loss = F.binary_cross_entropy_with_logits(logits, labels, weight=weights)
-                
+            
             loss.backward()
             
             optimizer.step()
@@ -720,12 +721,25 @@ def train_model(training_data_folder, model_folder, sequence_length=1024, dropou
         val_acc = val_correct / val_total
         train_loss_avg = train_loss / len(train_loader)
         val_loss_avg = val_loss / len(val_loader)
+        
+        # model.isotonic_regression.fit(logits_for_iso, labels_for_iso)
+        diagnostics = diagnose_model_probabilities(model, val_loader, device='cuda:0', verbose=False)
+        challenge_score = diagnostics['challenge_score']
+        tp = diagnostics['tp']
+        fn = diagnostics['fn']
+        tn = diagnostics['tn']
+        fp = diagnostics['fp']
 
-        if val_loss_avg < best_loss:
-            best_loss = val_loss_avg
+        if challenge_score > best_challenge_score:
+            best_challenge_score = challenge_score
             torch.save(model.state_dict(), os.path.join(model_folder, f'resnet_trans_trained_model.pkl'))
+            # joblib.dump(model.isotonic_regression, os.path.join(model_folder, f'resnet_trans_trained_model_iso.joblib'))
             print("*" * 50)
-            print(f"Best model saved to with loss {val_loss_avg:.7f} and acc {val_acc:.7f} saved at {os.path.join(model_folder, f'resnet_trans_trained_model.pkl')}")
+            print(f"Best model saved.")
+            print(f"    - Challenge score: {challenge_score:.7f}")
+            print(f"    - Acc: {val_acc:.7f}")
+            print(f"    - Saved model at {os.path.join(model_folder, f'resnet_trans_trained_model.pkl')}")
+            print(f"    - Saved isotonic regression at {os.path.join(model_folder, f'resnet_trans_trained_model_iso.joblib')}")
         
         # Step the learning rate scheduler
         scheduler.step()
@@ -748,11 +762,14 @@ def train_model(training_data_folder, model_folder, sequence_length=1024, dropou
                 print(f"  Train - Loss: {train_loss_avg:.7f}, Acc: {train_acc:.7f}, LR: {scheduler.get_last_lr()[0]:.7f}")
                 print(f"  Val   - Loss: {val_loss_avg:.7f}, Acc: {val_acc:.7f}, AUC: {val_auc:.7f}")
                 print(f"  Val   - Precision: {val_precision:.7f}, Recall: {val_recall:.7f}")
-                
+                print(f"  Val   - Challenge score: {challenge_score:.7f}")
+                print(f"  Val   - Total Predictions: {tp + fn + tn + fp} | TP: {tp}, FN: {fn}, TN: {tn}, FP: {fp}")
             except ImportError:
                 print(f"Epoch {epoch}:")
                 print(f"  Train - Loss: {train_loss_avg:.7f}, Acc: {train_acc:.7f}, LR: {scheduler.get_last_lr()[0]:.7f}")
                 print(f"  Val   - Loss: {val_loss_avg:.7f}, Acc: {val_acc:.7f}")
+                print(f"  Val   - Challenge score: {challenge_score:.7f}")
+                print(f"  Val   - Total Predictions: {tp + fn + tn + fp} | TP: {tp}, FN: {fn}, TN: {tn}, FP: {fp}")
                 print("  (Install sklearn for AUC/Precision/Recall metrics)")
             
             print("-" * 50)
@@ -795,6 +812,7 @@ def load_model(model_path, is_finetune=False, device='cpu'):
     
     state_dict = torch.load(model_path, map_location=device)
     model.load_state_dict_flexible(state_dict, load_finetuned_blocks=is_finetune)
+    # model.isotonic_regression = joblib.load(os.path.join(model_path.split('.')[0] + '_iso.joblib'))
     if is_finetune:
         model.finetune_mode()
     else:
